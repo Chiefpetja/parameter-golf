@@ -604,18 +604,69 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
+    # Dual-space relu^2 MLP with lightweight observation stats.
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = mlp_mult * dim
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
+        self.neg_beta: float = 0.0
+        self.dual_alpha: float = 0.0  # trainer-controlled: 0.0 early, 1.0 after switch
+
+        # Observation accumulators
+        self.obs_pos_sum: float = 0.0
+        self.obs_neg_sum: float = 0.0
+        self.obs_pos_active: float = 0.0
+        self.obs_neg_active: float = 0.0
+        self.obs_elem_count: int = 0
+
+    def reset_observation_stats(self) -> None:
+        self.obs_pos_sum = 0.0
+        self.obs_neg_sum = 0.0
+        self.obs_pos_active = 0.0
+        self.obs_neg_active = 0.0
+        self.obs_elem_count = 0
+
+    def get_observation_stats(self) -> dict[str, float]:
+        if self.obs_elem_count == 0:
+            return {
+                "mean_pos": 0.0,
+                "mean_neg": 0.0,
+                "active_pos_frac": 0.0,
+                "active_neg_frac": 0.0,
+                "neg_pos_ratio": 0.0,
+                "elem_count": 0.0,
+            }
+
+        mean_pos = self.obs_pos_sum / self.obs_elem_count
+        mean_neg = self.obs_neg_sum / self.obs_elem_count
+        active_pos_frac = self.obs_pos_active / self.obs_elem_count
+        active_neg_frac = self.obs_neg_active / self.obs_elem_count
+        neg_pos_ratio = mean_neg / (mean_pos + 1e-12)
+
+        return {
+            "mean_pos": mean_pos,
+            "mean_neg": mean_neg,
+            "active_pos_frac": active_pos_frac,
+            "active_neg_frac": active_neg_frac,
+            "neg_pos_ratio": neg_pos_ratio,
+            "elem_count": float(self.obs_elem_count),
+        }
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        u = self.fc(x)
+        pos = torch.relu(u).square()
+        neg = torch.relu(-u).square()
 
+        with torch.no_grad():
+            self.obs_pos_sum += float(pos.sum().item())
+            self.obs_neg_sum += float(neg.sum().item())
+            self.obs_pos_active += float((pos > 0).sum().item())
+            self.obs_neg_active += float((neg > 0).sum().item())
+            self.obs_elem_count += int(pos.numel())
+
+        return self.proj(pos + (self.dual_alpha * self.neg_beta) * neg)
 
 class Block(nn.Module):
     def __init__(
@@ -696,6 +747,58 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+
+    def set_dual_alpha(self, alpha: float) -> None:
+        for block in self.blocks:
+            if isinstance(block.mlp, MLP):
+                block.mlp.dual_alpha = float(alpha)
+
+    def reset_observation_stats(self) -> None:
+        for block in self.blocks:
+            if isinstance(block.mlp, MLP):
+                block.mlp.reset_observation_stats()
+
+    def get_observation_stats(self) -> dict[str, float]:
+        total_pos_sum = 0.0
+        total_neg_sum = 0.0
+        total_pos_active = 0.0
+        total_neg_active = 0.0
+        total_elem_count = 0.0
+
+        for block in self.blocks:
+            if isinstance(block.mlp, MLP):
+                stats = block.mlp.get_observation_stats()
+                elem_count = stats["elem_count"]
+                total_elem_count += elem_count
+                total_pos_sum += stats["mean_pos"] * elem_count
+                total_neg_sum += stats["mean_neg"] * elem_count
+                total_pos_active += stats["active_pos_frac"] * elem_count
+                total_neg_active += stats["active_neg_frac"] * elem_count
+
+        if total_elem_count == 0:
+            return {
+                "mean_pos": 0.0,
+                "mean_neg": 0.0,
+                "active_pos_frac": 0.0,
+                "active_neg_frac": 0.0,
+                "neg_pos_ratio": 0.0,
+                "elem_count": 0.0,
+            }
+
+        mean_pos = total_pos_sum / total_elem_count
+        mean_neg = total_neg_sum / total_elem_count
+        active_pos_frac = total_pos_active / total_elem_count
+        active_neg_frac = total_neg_active / total_elem_count
+        neg_pos_ratio = mean_neg / (mean_pos + 1e-12)
+
+        return {
+            "mean_pos": mean_pos,
+            "mean_neg": mean_neg,
+            "active_pos_frac": active_pos_frac,
+            "active_neg_frac": active_neg_frac,
+            "neg_pos_ratio": neg_pos_ratio,
+            "elem_count": total_elem_count,
+        }
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -967,7 +1070,10 @@ def main() -> None:
     stop_after_step: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-
+    dual_switch_step = int(0.30 * args.iterations)
+    if hasattr(base_model, "reset_observation_stats"):
+        base_model.reset_observation_stats()
+    
     step = 0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
@@ -1007,6 +1113,10 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+
+        if hasattr(base_model, "set_dual_alpha"):
+            base_model.set_dual_alpha(1.0)
+        
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -1032,6 +1142,9 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
+        if step == dual_switch_step and master_process:
+            log0(f"dual_alpha_switch: step:{step} alpha:1.0")
+
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
@@ -1039,10 +1152,28 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            obs_stats = (
+                base_model.get_observation_stats()
+                if hasattr(base_model, "get_observation_stats")
+                else {
+                    "mean_pos": 0.0,
+                    "mean_neg": 0.0,
+                    "active_pos_frac": 0.0,
+                    "active_neg_frac": 0.0,
+                    "neg_pos_ratio": 0.0,
+                }
+            )
+
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"obs_mean_pos:{obs_stats['mean_pos']:.6f} obs_mean_neg:{obs_stats['mean_neg']:.6f} "
+                f"obs_neg_pos_ratio:{obs_stats['neg_pos_ratio']:.6f} "
+                f"obs_active_pos:{obs_stats['active_pos_frac']:.6f} obs_active_neg:{obs_stats['active_neg_frac']:.6f}"
             )
+
+            if hasattr(base_model, "reset_observation_stats"):
+                base_model.reset_observation_stats()
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
