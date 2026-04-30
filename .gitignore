@@ -12,4 +12,6 @@ logs/
 records/
 final_model.pt
 final_model.int8.ptz
+*.pt
+*.ptz
 run_history.csv
